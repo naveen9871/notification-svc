@@ -1,0 +1,332 @@
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: notification-service
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: notification-config
+  namespace: notification-service
+data:
+  DEBUG: "True"
+  ALLOWED_HOSTS: "*"
+  MONGODB_HOST: "mongodb"
+  MONGODB_PORT: "27017"
+  MONGODB_NAME: "notification_db"
+  RABBITMQ_HOST: "rabbitmq"
+  RABBITMQ_PORT: "5672"
+  DJANGO_SETTINGS_MODULE: "notification_service.settings"
+
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: notification-secrets
+  namespace: notification-service
+type: Opaque
+stringData:
+  SECRET_KEY: "django-insecure-test-key-12345"
+  MONGODB_USER: "admin"
+  MONGODB_PASSWORD: "admin123"
+  RABBITMQ_USER: "guest"
+  RABBITMQ_PASSWORD: "guest"
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mongodb
+  namespace: notification-service
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mongodb
+  template:
+    metadata:
+      labels:
+        app: mongodb
+    spec:
+      containers:
+      - name: mongodb
+        image: mongo:6.0
+        ports:
+        - containerPort: 27017
+        env:
+        - name: MONGO_INITDB_ROOT_USERNAME
+          value: "admin"
+        - name: MONGO_INITDB_ROOT_PASSWORD
+          value: "admin123"
+        - name: MONGO_INITDB_DATABASE
+          value: "notification_db"
+        command: ["mongod", "--bind_ip_all", "--quiet"]
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "250m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mongodb
+  namespace: notification-service
+spec:
+  selector:
+    app: mongodb
+  ports:
+  - port: 27017
+    targetPort: 27017
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rabbitmq
+  namespace: notification-service
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: rabbitmq
+  template:
+    metadata:
+      labels:
+        app: rabbitmq
+    spec:
+      containers:
+      - name: rabbitmq
+        image: rabbitmq:3.12-management
+        ports:
+        - containerPort: 5672
+        - containerPort: 15672
+        env:
+        - name: RABBITMQ_DEFAULT_USER
+          value: "guest"
+        - name: RABBITMQ_DEFAULT_PASS
+          value: "guest"
+        readinessProbe:
+          exec:
+            command: ["rabbitmq-diagnostics", "check_running"]
+          initialDelaySeconds: 15
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 6
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "250m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rabbitmq
+  namespace: notification-service
+spec:
+  selector:
+    app: rabbitmq
+  ports:
+  - port: 5672
+    targetPort: 5672
+    name: amqp
+  - port: 15672
+    targetPort: 15672
+    name: management
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: notification-service
+  namespace: notification-service
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: notification-service
+  template:
+    metadata:
+      labels:
+        app: notification-service
+    spec:
+      initContainers:
+      - name: wait-for-dependencies
+        image: busybox:1.28
+        command:
+          - sh
+          - -c
+          - |
+            echo "Waiting for MongoDB and RabbitMQ..."
+            until nc -z mongodb 27017; do echo "Waiting for MongoDB..."; sleep 5; done
+            until nc -z rabbitmq 5672; do echo "Waiting for RabbitMQ..."; sleep 5; done
+            echo "Dependencies are ready!"
+      containers:
+      - name: notification-service
+        image: notification-service:latest
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 8005
+        env:
+        - name: DEBUG
+          value: "True"
+        - name: SECRET_KEY
+          valueFrom:
+            secretKeyRef:
+              name: notification-secrets
+              key: SECRET_KEY
+        - name: ALLOWED_HOSTS
+          value: "*"
+        - name: MONGODB_HOST
+          value: "mongodb"
+        - name: MONGODB_PORT
+          value: "27017"
+        - name: MONGODB_NAME
+          value: "notification_db"
+        - name: MONGODB_USER
+          valueFrom:
+            secretKeyRef:
+              name: notification-secrets
+              key: MONGODB_USER
+        - name: MONGODB_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: notification-secrets
+              key: MONGODB_PASSWORD
+        - name: RABBITMQ_HOST
+          value: "rabbitmq"
+        - name: RABBITMQ_PORT
+          value: "5672"
+        - name: RABBITMQ_USER
+          valueFrom:
+            secretKeyRef:
+              name: notification-secrets
+              key: RABBITMQ_USER
+        - name: RABBITMQ_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: notification-secrets
+              key: RABBITMQ_PASSWORD
+        - name: DJANGO_SETTINGS_MODULE
+          value: "notification_service.settings"
+        command: ["/bin/sh", "-c"]
+        args:
+          - |
+            echo "=== Starting Notification Service ==="
+            python manage.py migrate
+            echo "Starting Django server..."
+            python manage.py runserver 0.0.0.0:8005
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "250m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: notification-service
+  namespace: notification-service
+spec:
+  selector:
+    app: notification-service
+  ports:
+  - port: 8005
+    targetPort: 8005
+    nodePort: 30005
+  type: NodePort
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: notification-consumer
+  namespace: notification-service
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: notification-consumer
+  template:
+    metadata:
+      labels:
+        app: notification-consumer
+    spec:
+      initContainers:
+      - name: wait-for-services
+        image: busybox:1.28
+        command:
+          - sh
+          - -c
+          - |
+            echo "Waiting for MongoDB..."
+            until nc -z mongodb 27017; do echo "MongoDB not ready"; sleep 5; done
+            echo "MongoDB ready!"
+            echo "Waiting for RabbitMQ..."
+            for i in $(seq 1 30); do
+              nc -z rabbitmq 5672 && echo "RabbitMQ ready!" && exit 0
+              echo "RabbitMQ not ready ($i)..."; sleep 5
+            done
+            echo "RabbitMQ not ready after timeout"; exit 1
+      containers:
+      - name: notification-consumer
+        image: notification-service:latest
+        imagePullPolicy: IfNotPresent
+        env:
+        - name: DEBUG
+          value: "True"
+        - name: DJANGO_SETTINGS_MODULE
+          value: "notification_service.settings"
+        - name: RABBITMQ_HOST
+          value: "rabbitmq"
+        - name: RABBITMQ_PORT
+          value: "5672"
+        - name: RABBITMQ_USER
+          valueFrom:
+            secretKeyRef:
+              name: notification-secrets
+              key: RABBITMQ_USER
+        - name: RABBITMQ_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: notification-secrets
+              key: RABBITMQ_PASSWORD
+        - name: MONGODB_HOST
+          value: "mongodb"
+        - name: MONGODB_PORT
+          value: "27017"
+        - name: MONGODB_USER
+          valueFrom:
+            secretKeyRef:
+              name: notification-secrets
+              key: MONGODB_USER
+        - name: MONGODB_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: notification-secrets
+              key: MONGODB_PASSWORD
+        command: ["/bin/sh", "-c"]
+        args:
+          - |
+            echo "=== Starting Notification Consumer ==="
+            cd /app/notifications
+            python consumer.py
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "250m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
